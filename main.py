@@ -1,335 +1,431 @@
-#!/usr/bin/env python3
-"""MuteOne Desktop App - Audio Source Separation Tool"""
-
-import sys
-import os
-import ssl
-import warnings
-import subprocess
-import time
-from pathlib import Path
+import sys, os, threading, tempfile
+import numpy as np
+import sounddevice as sd
+import soundfile as sf
 
 from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QVBoxLayout, QHBoxLayout,
-    QWidget, QPushButton, QLabel, QFileDialog, QProgressBar,
-    QTextEdit, QGroupBox, QMessageBox, QRadioButton, QButtonGroup,
-    QCheckBox
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QLabel, QRadioButton, QButtonGroup,
+    QProgressBar, QMessageBox, QFileDialog, QComboBox
 )
-from PyQt6.QtCore import QTimer, Qt
-from PyQt6.QtGui import QFont
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject
+from PyQt6.QtGui import QPainter, QLinearGradient, QColor, QPen
 
-import torch
-import torchaudio
-import numpy as np
-
-# Local imports
-from audio.recording import LiveRecorder, LiveLevelMonitor
-from audio.processor import AudioProcessor
-from audio.player import AudioPlayer
-from ui.level_meter import LevelMeter
-from ui.waveform_widget import AudioEditorSection
-from ui.recording_booth import RecordingBooth
-
-# Fix SSL certificate issues on macOS
-ssl._create_default_https_context = ssl._create_unverified_context
-warnings.filterwarnings("ignore", category=UserWarning, module="torchaudio")
+from processor import AudioProcessor
+from model_manager import ModelManager
 
 
-class MuteOneApp(QMainWindow):
-    def __init__(self):
+# -------------------------
+# Worker signals
+# -------------------------
+class WorkerSignals(QObject):
+    status = pyqtSignal(str, str)   # msg, color
+    progress = pyqtSignal(int)
+    finished = pyqtSignal(str)
+    error = pyqtSignal(str)
+
+
+# -------------------------
+# Smooth custom level meter
+# -------------------------
+class SmoothLevelMeter(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.level = 0
+        self.setFixedHeight(12)
+        self.setMinimumWidth(150)
+
+    def set_level(self, level):
+        self.level = max(0, min(100, level))
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor(10, 10, 10))
+        painter.setPen(QPen(QColor(30, 30, 30), 1))
+        painter.drawRect(self.rect().adjusted(0, 0, -1, -1))
+
+        if self.level > 0:
+            gradient = QLinearGradient(0, 0, self.width(), 0)
+            gradient.setColorAt(0.0, QColor(76, 175, 80))
+            gradient.setColorAt(0.6, QColor(139, 195, 74))
+            gradient.setColorAt(0.8, QColor(255, 235, 59))
+            gradient.setColorAt(0.95, QColor(255, 152, 0))
+            gradient.setColorAt(1.0, QColor(244, 67, 54))
+            level_width = int((self.width() - 4) * self.level / 100)
+            painter.fillRect(2, 2, level_width, self.height() - 4, gradient)
+
+
+# -------------------------
+# Main Window
+# -------------------------
+class MuteOne(QMainWindow):
+    def __init__(self, processor: AudioProcessor):
         super().__init__()
-        self.input_file = None
-        self.output_dir = str(Path.home() / "Downloads")
-        self.processing_thread = None
-        self.recording_thread = None
-        self.level_monitor = None
-        self.is_recording = False
-        self.recorded_file_path = None
-        self.playback_process = None
-        self.is_playing = False
+        self.setWindowTitle("MuteOne by Omotiv Audio")
+        self.setGeometry(200, 200, 720, 480)
 
-        # Editor-specific playback
-        self.audio_player = AudioPlayer()
-        self.editor_is_playing = False
-        self.playback_timer = None
-        self.playback_position_sec = 0.0
+        self.processor = processor
+        self.current_file = None
+        self.output_file = None
+        self.last_muted = None
+        self.playing = False
+        self.signals = WorkerSignals()
 
-        os.makedirs(self.output_dir, exist_ok=True)
+        # signals
+        self.signals.status.connect(self.update_status)
+        self.signals.progress.connect(self.update_progress)
+        self.signals.finished.connect(self.on_finished)
+        self.signals.error.connect(self.show_error)
+
+        self.setStyleSheet("""
+            QWidget {
+                background-color: #121212;
+                color: #e0e0e0;
+                font-family: Arial;
+                font-size: 13px;
+            }
+            QPushButton {
+                background-color: #2a2a2a;
+                color: #e0e0e0;
+                border-radius: 4px;
+                padding: 5px 12px;
+            }
+            QPushButton:hover {
+                background-color: #3a3a3a;
+            }
+            QPushButton#primary {
+                background-color: #1db954;
+                color: white;
+                font-weight: bold;
+            }
+            QPushButton#primary:hover {
+                background-color: #1ed760;
+            }
+            QLabel#status {
+                min-height: 26px;
+                padding: 4px 8px;
+                border-radius: 4px;
+                font-weight: bold;
+                qproperty-alignment: AlignCenter;
+                font-size: 12px;
+            }
+        """)
+
         self.init_ui()
 
     def init_ui(self):
-        self.setWindowTitle("MuteOne - AI Audio Source Separation")
-        self.setGeometry(100, 100, 700, 750)
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
 
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        layout = QVBoxLayout(central_widget)
+        # Upload
+        self.upload_btn = QPushButton("Upload File")
+        self.upload_btn.clicked.connect(self.upload_file)
+        layout.addWidget(self.upload_btn)
 
-        # Title
-        title = QLabel("MuteOne")
-        title_font = QFont()
-        title_font.setPointSize(24)
-        title_font.setBold(True)
-        title.setFont(title_font)
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(title)
+        # Separation choices
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Mute:"))
+        self.radio_group = QButtonGroup()
+        for r in ["Vocals", "Drums", "Bass", "Other"]:
+            rb = QRadioButton(r)
+            if r == "Vocals":
+                rb.setChecked(True)
+            self.radio_group.addButton(rb)
+            row.addWidget(rb)
+        layout.addLayout(row)
 
-        subtitle = QLabel("Mute one instrument, keep the rest")
-        subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        subtitle.setStyleSheet("color: #666; margin-bottom: 20px;")
-        layout.addWidget(subtitle)
+        # Original/Separated selection
+        self.file_group = QButtonGroup()
+        self.file_group.setExclusive(True)
 
-        # === Recording Section ===
-        recording_group = QGroupBox("Live Recording")
-        recording_layout = QVBoxLayout(recording_group)
+        self.original_rb = QRadioButton("Original: (none)")
+        self.separated_rb = QRadioButton("Separated: (none)")
+        self.file_group.addButton(self.original_rb)
+        self.file_group.addButton(self.separated_rb)
+        self.original_rb.setChecked(True)
+        layout.addWidget(self.original_rb)
+        layout.addWidget(self.separated_rb)
 
-        buttons_layout = QHBoxLayout()
-        self.start_recording_btn = QPushButton("🔴 Record")
-        self.start_recording_btn.clicked.connect(self.start_recording)
-        self.stop_recording_btn = QPushButton("⏹️ Stop")
-        self.stop_recording_btn.clicked.connect(self.stop_recording)
-        self.stop_recording_btn.setEnabled(False)
-        buttons_layout.addWidget(self.start_recording_btn)
-        buttons_layout.addWidget(self.stop_recording_btn)
-        recording_layout.addLayout(buttons_layout)
+        # Transport + level meter
+        row = QHBoxLayout()
+        self.rewind_btn = QPushButton("⏮")
+        self.stop_btn = QPushButton("■")
+        self.play_btn = QPushButton("▶")
+        for btn in (self.rewind_btn, self.stop_btn, self.play_btn):
+            btn.setFixedSize(40, 28)
+            row.addWidget(btn)
 
-        self.recording_status = QLabel("Ready to record")
-        recording_layout.addWidget(self.recording_status)
-        self.recording_timer = QLabel("00:00")
-        self.recording_timer.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        recording_layout.addWidget(self.recording_timer)
+        self.level_meter = SmoothLevelMeter()
+        row.addWidget(self.level_meter)
+        layout.addLayout(row)
 
-        # Level meters
-        self.level_meter = LevelMeter(channels=2)
-        recording_layout.addWidget(self.level_meter)
+        self.rewind_btn.clicked.connect(self.rewind_audio)
+        self.stop_btn.clicked.connect(self.stop_audio)
+        self.play_btn.clicked.connect(self.toggle_play)
 
-        layout.addWidget(recording_group)
+        # Start/Cancel
+        row = QHBoxLayout()
+        self.start_btn = QPushButton("Start Separation")
+        self.start_btn.setObjectName("primary")
+        self.start_btn.clicked.connect(self.start_separation)
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.clicked.connect(self.cancel_separation)
+        row.addWidget(self.start_btn)
+        row.addWidget(self.cancel_btn)
+        layout.addLayout(row)
 
-        # File input
-        file_group = QGroupBox("Select Audio File")
-        file_layout = QHBoxLayout(file_group)
-        self.select_file_btn = QPushButton("Choose File")
-        self.select_file_btn.clicked.connect(self.select_file)
-        file_layout.addWidget(self.select_file_btn)
-        self.file_label = QLabel("No file selected")
-        file_layout.addWidget(self.file_label, 1)
+        # Progress + status
+        self.progress = QProgressBar()
+        self.progress.setVisible(False)
+        layout.addWidget(self.progress)
+        self.status_label = QLabel("Idle")
+        self.status_label.setObjectName("status")
+        self.status_label.setFixedHeight(28)
+        layout.addWidget(self.status_label)
 
-        # Booth button (greyed out until file/recording)
-        self.open_booth_btn = QPushButton("Open Recording Booth")
-        self.open_booth_btn.setEnabled(False)
-        self.open_booth_btn.clicked.connect(self.open_recording_booth)
-        file_layout.addWidget(self.open_booth_btn)
+        # Export
+        row = QHBoxLayout()
+        row.addStretch()
+        self.format_combo = QComboBox()
+        self.format_combo.addItems(["MP3", "WAV"])
+        self.format_combo.setFixedWidth(80)
+        self.export_btn = QPushButton("Export")
+        self.export_btn.setObjectName("primary")
+        self.export_btn.setEnabled(False)
+        self.export_btn.clicked.connect(self.export_file)
+        row.addWidget(QLabel("Format:"))
+        row.addWidget(self.format_combo)
+        row.addWidget(self.export_btn)
+        layout.addLayout(row)
 
-        layout.addWidget(file_group)
+    # -------------------------
+    # File Handling
+    # -------------------------
+    def upload_file(self):
+        downloads = os.path.join(os.path.expanduser("~"), "Downloads")
+        file, _ = QFileDialog.getOpenFileName(self, "Select audio", downloads, "Audio Files (*.wav *.mp3)")
+        if file:
+            self.current_file = file
+            self.original_rb.setText(f"Original: {os.path.basename(file)}")
+            self.update_status(f"Loaded: {os.path.basename(file)}", "gray")
 
-        # Audio Editor (collapsible)
-        self.audio_editor = AudioEditorSection()
-        self.audio_editor.play_requested.connect(self.editor_play_pause_audio)
-        self.audio_editor.stop_requested.connect(self.editor_stop_audio)
-        self.audio_editor.seek_requested.connect(self.editor_seek_audio)
-        layout.addWidget(self.audio_editor)
+    # -------------------------
+    # Transport + Level Meter
+    # -------------------------
+    def get_selected_file(self):
+        if self.original_rb.isChecked():
+            return self.current_file
+        elif self.separated_rb.isChecked():
+            return self.output_file
+        return None
 
-        # Instrument selection
-        instrument_group = QGroupBox("Mute One Instrument")
-        instrument_layout = QVBoxLayout(instrument_group)
-        self.instrument_group_buttons = QButtonGroup(self)
-        self.instrument_group_buttons.setExclusive(True)
-        self.instrument_radios = {}
-        instruments = [
-            ("vocals", "Vocals"),
-            ("drums", "Drums"),
-            ("bass", "Bass"),
-            ("other", "Other"),
-        ]
-        for instrument_key, instrument_label in instruments:
-            radio = QRadioButton(instrument_label)
-            self.instrument_radios[instrument_key] = radio
-            self.instrument_group_buttons.addButton(radio)
-            instrument_layout.addWidget(radio)
-        self.instrument_radios["vocals"].setChecked(True)
-
-        self.high_quality_checkbox = QCheckBox("High Quality Vocal Removal")
-        instrument_layout.addWidget(self.high_quality_checkbox)
-        layout.addWidget(instrument_group)
-
-        # Process
-        self.process_btn = QPushButton("Process Audio")
-        self.process_btn.clicked.connect(self.process_audio)
-        self.process_btn.setEnabled(False)
-        layout.addWidget(self.process_btn)
-
-        # Progress
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setVisible(False)
-        layout.addWidget(self.progress_bar)
-
-        # Status
-        self.status_text = QTextEdit()
-        self.status_text.setReadOnly(True)
-        self.status_text.setMaximumHeight(140)
-        layout.addWidget(self.status_text)
-
-        # Start idle monitoring
-        self.start_level_monitoring()
-
-    # ===== Recording =====
-    def start_level_monitoring(self):
-        self.level_monitor = LiveLevelMonitor()
-        self.level_monitor.audio_level_updated.connect(self.update_audio_levels)
-        self.level_monitor.error_occurred.connect(self.on_monitoring_error)
-        self.level_monitor.start_monitoring()
-
-    def stop_level_monitoring(self):
-        if self.level_monitor:
-            self.level_monitor.stop_monitoring()
-            self.level_monitor.wait(1000)
-
-    def update_audio_levels(self, audio_data):
-        self.level_meter.update_levels(audio_data)
-
-    def on_monitoring_error(self, error_message):
-        self.add_status(f"Monitor error: {error_message}")
-
-    def start_recording(self):
-        self.stop_level_monitoring()
-        self.recording_thread = LiveRecorder()
-        self.recording_thread.recording_started.connect(self.on_recording_started)
-        self.recording_thread.recording_stopped.connect(self.on_recording_stopped)
-        self.recording_thread.recording_time_updated.connect(
-            lambda t: self.recording_timer.setText(t)
-        )
-        self.recording_thread.audio_level_updated.connect(self.update_audio_levels)
-        self.recording_thread.start_recording()
-
-    def stop_recording(self):
-        if self.recording_thread:
-            self.recording_thread.stop_recording()
-
-    def on_recording_started(self):
-        self.is_recording = True
-        self.start_recording_btn.setEnabled(False)
-        self.stop_recording_btn.setEnabled(True)
-        self.recording_status.setText("Recording...")
-
-    def on_recording_stopped(self, temp_file_path):
-        self.is_recording = False
-        self.start_recording_btn.setEnabled(True)
-        self.stop_recording_btn.setEnabled(False)
-        self.recording_status.setText("Recording complete")
-        self.recorded_file_path = temp_file_path
-        self.input_file = temp_file_path
-        self.file_label.setText(os.path.basename(temp_file_path))
-        self.process_btn.setEnabled(True)
-        self.open_booth_btn.setEnabled(True)
-        self.audio_editor.load_audio(temp_file_path)
-        self.start_level_monitoring()
-
-    # ===== Audio Editor =====
-    def editor_play_pause_audio(self):
-        if not self.input_file:
+    def toggle_play(self):
+        target = self.get_selected_file()
+        if not target or not os.path.exists(target):
+            self.show_error("No valid file selected for playback")
             return
-        if self.editor_is_playing:
-            self.audio_player.pause()
-            self.editor_is_playing = False
-            self.audio_editor.set_play_button_state(False)
-        else:
-            self.audio_player.load(self.input_file)
-            self.audio_player.play()
-            self.editor_is_playing = True
-            self.audio_editor.set_play_button_state(True)
-            self.playback_position_sec = 0.0
-            self.playback_timer = QTimer(self)
-            self.playback_timer.timeout.connect(self.update_editor_cursor)
-            self.playback_timer.start(30)
 
-    def update_editor_cursor(self):
-        if not self.audio_player.is_playing:
+        if self.playing:
+            sd.stop()
+            self.playing = False
+            self.play_btn.setText("▶")
+            self.update_status("Paused", "gray")
+            if hasattr(self, "meter_timer"):
+                self.meter_timer.stop()
+            self.level_meter.set_level(0)
             return
-        pos = self.audio_player.get_position()
-        dur = self.audio_player.get_duration()
-        if pos >= dur:
-            self.editor_stop_audio()
-            return
-        self.audio_editor.update_playback_position(pos)
 
-    def editor_stop_audio(self):
-        self.audio_player.stop()
-        self.editor_is_playing = False
-        if self.playback_timer:
-            self.playback_timer.stop()
-        self.audio_editor.update_playback_position(0.0)
-        self.audio_editor.set_play_button_state(False)
-
-    def editor_seek_audio(self, pos_seconds):
-        self.audio_player.seek(pos_seconds)
-        self.audio_editor.update_playback_position(pos_seconds)
-
-    # ===== Booth =====
-    def open_recording_booth(self):
-        if not self.input_file or not os.path.exists(self.input_file):
-            QMessageBox.warning(self, "Error", "No audio file loaded for the booth.")
-            return
         try:
-            booth = RecordingBooth(self.input_file, self.output_dir)
-            booth.exec()
+            data, sr = sf.read(target, dtype="float32")
+            sd.default.samplerate = sr
+
+            def playback_fn():
+                try:
+                    with sd.OutputStream(samplerate=sr,
+                                         channels=data.shape[1] if data.ndim > 1 else 1) as stream:
+                        stream.write(data)
+                finally:
+                    self.playing = False
+                    self.play_btn.setText("▶")
+                    self.level_meter.set_level(0)
+
+            threading.Thread(target=playback_fn, daemon=True).start()
+
+            blocksize = int(sr * 0.05)
+            envelope = []
+            for start in range(0, len(data), blocksize):
+                block = data[start:start+blocksize]
+                if block.ndim > 1:
+                    block = block.mean(axis=1)
+                level = int(np.linalg.norm(block) * 10)
+                envelope.append(min(100, level))
+
+            self.meter_index = 0
+            self.meter_data = envelope
+
+            if hasattr(self, "meter_timer"):
+                self.meter_timer.stop()
+            self.meter_timer = QTimer()
+            self.meter_timer.timeout.connect(self.update_meter_from_envelope)
+            self.meter_timer.start(50)
+
+            self.playing = True
+            self.play_btn.setText("⏸")
+            self.update_status(f"Playing: {os.path.basename(target)}", "green")
+
         except Exception as e:
-            self.add_status(f"Booth error: {e}")
+            self.show_error(f"Playback failed: {e}")
 
-    # ===== File selection =====
-    def select_file(self):
-        file_path, _ = QFileDialog.getOpenFileName(
-            self, "Select Audio File", "",
-            "Audio Files (*.wav *.mp3 *.flac *.m4a *.ogg)"
-        )
-        if file_path:
-            self.input_file = file_path
-            self.file_label.setText(os.path.basename(file_path))
-            self.process_btn.setEnabled(True)
-            self.open_booth_btn.setEnabled(True)
-            self.audio_editor.load_audio(file_path)
-
-    # ===== Processing =====
-    def process_audio(self):
-        if not self.input_file:
+    def update_meter_from_envelope(self):
+        if not self.playing or self.meter_index >= len(self.meter_data):
+            self.level_meter.set_level(0)
+            if hasattr(self, "meter_timer"):
+                self.meter_timer.stop()
+            self.playing = False
+            self.play_btn.setText("▶")
             return
-        instruments_to_remove = [
-            key for key, radio in self.instrument_radios.items() if radio.isChecked()
-        ]
-        if not instruments_to_remove:
-            QMessageBox.warning(self, "Error", "Select an instrument to mute")
+        self.level_meter.set_level(self.meter_data[self.meter_index])
+        self.meter_index += 1
+
+    def stop_audio(self):
+        sd.stop()
+        self.playing = False
+        self.play_btn.setText("▶")
+        self.level_meter.set_level(0)
+        self.update_status("Stopped", "gray")
+        if hasattr(self, "meter_timer"):
+            self.meter_timer.stop()
+
+    def rewind_audio(self):
+        self.stop_audio()
+        self.toggle_play()
+
+    # -------------------------
+    # Separation
+    # -------------------------
+    def start_separation(self):
+        if not self.current_file:
+            self.show_error("No file uploaded")
             return
 
-        high_quality = instruments_to_remove[0] == "vocals" and self.high_quality_checkbox.isChecked()
-        self.processing_thread = AudioProcessor(
-            self.input_file, self.output_dir, instruments_to_remove, high_quality
+        checked = self.radio_group.checkedButton()
+        if not checked:
+            self.show_error("Select a stem to mute")
+            return
+        choice = checked.text().lower()
+        self.last_muted = choice
+        self.progress.setVisible(True)
+        self.progress.setValue(0)
+        self.start_btn.setEnabled(False)
+
+        def worker():
+            try:
+                out = self.processor.run(
+                    self.current_file, "", [choice],
+                    progress_callback=self.signals.progress.emit,
+                    status_callback=lambda msg: self.signals.status.emit(msg, "gray"),
+                    cancelled=lambda: False
+                )
+                if out:
+                    self.signals.finished.emit(out)
+                else:
+                    self.signals.status.emit("Failed", "red")
+            except Exception as e:
+                self.signals.error.emit(str(e))
+
+        threading.Thread(target=worker, daemon=True).start()
+        self.update_status(f"Processing {choice}...", "gray")
+
+    def cancel_separation(self):
+        self.processor.cancel()
+        self.start_btn.setEnabled(True)
+        self.update_status("Canceled", "red")
+        self.progress.setVisible(False)
+
+    def on_finished(self, filepath):
+        self.progress.setVisible(False)
+        self.start_btn.setEnabled(True)
+        if filepath and os.path.exists(filepath):
+            self.output_file = filepath
+            self.separated_rb.setText(f"Separated: {os.path.basename(filepath)}")
+            self.separated_rb.setChecked(True)
+            self.export_btn.setEnabled(True)
+            self.update_status("Success", "green")
+        else:
+            self.update_status("Error", "red")
+
+    # -------------------------
+    # Export
+    # -------------------------
+    def export_file(self):
+        if not self.output_file or not os.path.exists(self.output_file):
+            self.show_error("No processed file available to export")
+            return
+
+        fmt = self.format_combo.currentText().lower()
+        base = os.path.splitext(os.path.basename(self.output_file))[0]
+        suggested_name = f"{base}.{fmt}"
+
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Processed File",
+            os.path.join(os.path.expanduser("~"), "Documents", "MuteOne", suggested_name),
+            "Audio Files (*.wav *.mp3)"
         )
-        self.processing_thread.progress_updated.connect(self.update_progress)
-        self.processing_thread.status_updated.connect(self.add_status)
-        self.processing_thread.processing_complete.connect(self.processing_finished)
-        self.processing_thread.start()
-        self.add_status(f"Processing {os.path.basename(self.input_file)}...")
+        if not file_path:
+            return
 
-    def update_progress(self, value):
-        self.progress_bar.setVisible(True)
-        self.progress_bar.setValue(value)
+        try:
+            data, sr = sf.read(self.output_file, dtype="float32")
+            if fmt == "wav":
+                sf.write(file_path, data, sr, format="WAV")
+            elif fmt == "mp3":
+                from pydub import AudioSegment
+                temp_wav = os.path.join(tempfile.gettempdir(), f"{base}_temp.wav")
+                sf.write(temp_wav, data, sr, format="WAV")
+                AudioSegment.from_wav(temp_wav).export(
+                    file_path,
+                    format="mp3",
+                    bitrate="320k",
+                    parameters=["-ar", str(sr)]
+                )
+                os.remove(temp_wav)
+            self.update_status(f"Exported to {file_path}", "green")
+        except Exception as e:
+            self.show_error(f"Export failed: {e}")
 
-    def processing_finished(self, output_path):
-        self.add_status(f"Saved: {output_path}")
-        QMessageBox.information(self, "Done", f"Saved file:\n{output_path}")
-
-    def add_status(self, message):
-        self.status_text.append(f"• {message}")
-        self.status_text.verticalScrollBar().setValue(
-            self.status_text.verticalScrollBar().maximum()
+    # -------------------------
+    # Status + Error
+    # -------------------------
+    def update_status(self, msg, color="gray"):
+        colors = {
+            "green": "background-color: #1db954; color: white;",
+            "red": "background-color: #e22134; color: white;",
+            "gray": "background-color: #333; color: #e0e0e0;"
+        }
+        style = colors.get(color, "background-color: #333; color: white;")
+        self.status_label.setText(msg)
+        self.status_label.setStyleSheet(
+            style + "padding: 4px 8px; border-radius: 4px; font-weight: bold; font-size: 12px;"
         )
 
+    def update_progress(self, val):
+        self.progress.setValue(val)
 
-def main():
-    app = QApplication(sys.argv)
-    window = MuteOneApp()
-    window.show()
-    sys.exit(app.exec())
+    def show_error(self, msg):
+        self.update_status("Error", "red")
+        QMessageBox.critical(self, "Error", msg)
 
 
+# -------------------------
+# Run App
+# -------------------------
 if __name__ == "__main__":
-    main()
+    model_manager = ModelManager()
+    processor = AudioProcessor(model_manager)
+    app = QApplication(sys.argv)
+    win = MuteOne(processor)
+    win.show()
+    sys.exit(app.exec())
